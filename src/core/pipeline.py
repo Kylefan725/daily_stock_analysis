@@ -99,7 +99,7 @@ from src.core.trading_calendar import (
     get_market_now,
     is_market_open,
 )
-from data_provider.us_index_mapping import is_us_stock_code
+from data_provider.futu_comment_sentiment import is_community_eligible
 from bot.models import BotMessage
 
 
@@ -683,18 +683,22 @@ class StockAnalysisPipeline:
                 except Exception as exc:
                     logger.warning("%s(%s) Futu OpenD 注入失败: %s", stock_name, code, exc)
 
-            # Step 4.5: Social sentiment intelligence (US stocks only)
-            if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
+            # Step 4.5: Futu community sentiment (retail discussion, not official)
+            if is_community_eligible(code):
                 try:
-                    social_context = self.social_sentiment_service.get_social_context(code)
-                    if social_context:
-                        logger.info(f"{stock_name}({code}) Social sentiment data retrieved")
+                    from data_provider.futu_comment_sentiment import (
+                        format_prompt_block as format_community_block,
+                        snapshot as community_snapshot,
+                    )
+                    community_block = format_community_block(community_snapshot(code))
+                    if community_block:
+                        logger.info("%s(%s) Futu community sentiment injected", stock_name, code)
                         if news_context:
-                            news_context = news_context + "\n\n" + social_context
+                            news_context = news_context + "\n\n" + community_block
                         else:
-                            news_context = social_context
-                except Exception as e:
-                    logger.warning(f"{stock_name}({code}) Social sentiment fetch failed: {e}")
+                            news_context = community_block
+                except Exception as exc:
+                    logger.warning("%s(%s) Futu community sentiment failed: %s", stock_name, code, exc)
 
             if persisted_intelligence_context:
                 news_context = (
@@ -1405,21 +1409,23 @@ class StockAnalysisPipeline:
             if trend_result:
                 initial_context["trend_result"] = self._safe_to_dict(trend_result)
 
-            # Agent path: inject social sentiment as news_context so both
-            # executor (_build_user_message) and orchestrator (ctx.set_data)
-            # can consume it through the existing news_context channel
-            if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
+            # Agent path: Futu community sentiment through news_context
+            if is_community_eligible(code):
                 try:
-                    social_context = self.social_sentiment_service.get_social_context(code)
-                    if social_context:
+                    from data_provider.futu_comment_sentiment import (
+                        format_prompt_block as format_community_block,
+                        snapshot as community_snapshot,
+                    )
+                    community_block = format_community_block(community_snapshot(code))
+                    if community_block:
                         existing = initial_context.get("news_context")
                         if existing:
-                            initial_context["news_context"] = existing + "\n\n" + social_context
+                            initial_context["news_context"] = existing + "\n\n" + community_block
                         else:
-                            initial_context["news_context"] = social_context
-                        logger.info(f"[{code}] Agent mode: social sentiment data injected into news_context")
-                except Exception as e:
-                    logger.warning(f"[{code}] Agent mode: social sentiment fetch failed: {e}")
+                            initial_context["news_context"] = community_block
+                        logger.info("[%s] Agent mode: Futu community sentiment injected", code)
+                except Exception as exc:
+                    logger.warning("[%s] Agent mode: Futu community sentiment failed: %s", code, exc)
 
             persisted_intelligence_context = self._load_persisted_intelligence_context(
                 code=code,

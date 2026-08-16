@@ -249,3 +249,17 @@ class _ThreadlessTestClient:
 
 fastapi.testclient.TestClient = _ThreadlessTestClient
 starlette.testclient.TestClient = _ThreadlessTestClient
+
+
+import pytest
+from unittest.mock import patch
+
+
+@pytest.fixture(autouse=True)
+def _block_live_futu_community_http():
+    """Never hit ai-news-search.futunn.com from the test suite."""
+    with patch(
+        "data_provider.futu_comment_sentiment.urlopen",
+        side_effect=OSError("no live futunn.com in tests"),
+    ):
+        yield

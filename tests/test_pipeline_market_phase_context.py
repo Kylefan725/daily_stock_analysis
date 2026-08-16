@@ -509,9 +509,7 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         pipeline._ensure_agent_history = MagicMock()
         pipeline.social_sentiment_service = MagicMock()
         pipeline.social_sentiment_service.is_available = True
-        pipeline.social_sentiment_service.get_social_context.return_value = (
-            "Social sentiment raw payload should stay in legacy news_context only."
-        )
+        community_block = "社区情绪（Futu，非官方） raw payload should stay in legacy news_context only."
 
         from src.agent.executor import AgentResult
 
@@ -529,7 +527,13 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
             provider="test",
         )
 
-        with patch("src.agent.factory.build_agent_executor", return_value=executor):
+        with patch("src.agent.factory.build_agent_executor", return_value=executor), patch(
+            "data_provider.futu_comment_sentiment.snapshot",
+            return_value={"status": "ok", "symbol": "AAPL"},
+        ), patch(
+            "data_provider.futu_comment_sentiment.format_prompt_block",
+            return_value=community_block,
+        ):
             result = pipeline._analyze_with_agent(
                 code="AAPL",
                 report_type=ReportType.SIMPLE,
@@ -544,11 +548,11 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
 
         self.assertIsNotNone(result)
         run_context = executor.run.call_args.kwargs["context"]
-        self.assertIn("Social sentiment raw payload", run_context["news_context"])
+        self.assertIn("社区情绪（Futu，非官方） raw payload", run_context["news_context"])
         summary = run_context["analysis_context_pack_summary"]
         self.assertIn("新闻: available", summary)
         self.assertNotIn("新闻: missing", summary)
-        self.assertNotIn("Social sentiment raw payload", summary)
+        self.assertNotIn("社区情绪（Futu，非官方） raw payload", summary)
 
         save_kwargs = pipeline.db.save_analysis_history.call_args.kwargs
         self.assertNotIn("analysis_context_pack_summary", save_kwargs["context_snapshot"])

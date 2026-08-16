@@ -148,8 +148,9 @@ def test_news_context_injects_same_futu_block_whether_search_on_or_off() -> None
     news_on = captured[True]
     assert expected_block.strip() in news_off
     assert expected_block.strip() in news_on
-    assert news_off.strip() == expected_block.strip()
+    assert news_off.startswith(expected_block.strip())
     assert news_on.startswith(expected_block.strip())
+    assert news_off.index("权威数据（Futu OpenD，非搜索）") < news_off.index("社区情绪（Futu，非官方）")
     assert "SEARCH INTEL BLOCK" in news_on
     assert news_on.index(expected_block.strip()) < news_on.index("SEARCH INTEL BLOCK")
 
