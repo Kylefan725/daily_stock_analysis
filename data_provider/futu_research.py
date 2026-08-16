@@ -24,6 +24,8 @@ _CAPITAL_DIST = _SCRIPT_ROOT / "get_capital_distribution.py"
 _RATING_CHANGE = _SCRIPT_ROOT / "get_rating_change.py"
 _EARNINGS_CAL = _SCRIPT_ROOT / "get_earnings_calendar.py"
 _PRE_MARKET = _SCRIPT_ROOT / "get_us_pre_market_rank.py"
+_SHORT_INTEREST = _SCRIPT_ROOT / "get_short_interest.py"
+_SEARCH_NEWS = _SCRIPT_ROOT / "get_search_news.py"
 
 TAPE_UNIVERSE = frozenset(
     {
@@ -48,6 +50,8 @@ TAPE_UNIVERSE = frozenset(
 
 _market_tape_lock = threading.Lock()
 _market_tape_cache: Optional[Dict[str, Any]] = None
+_search_news_lock = threading.Lock()
+_search_news_cache: Dict[str, List[Dict[str, str]]] = {}
 
 
 def to_futu_code(stock_code: str) -> Optional[str]:
@@ -134,6 +138,21 @@ def _fmt_num(value: Any, digits: int = 2) -> str:
     return f"{num:,.{digits}f}"
 
 
+def _fmt_signed(value: Any, digits: int = 2) -> str:
+    num = _safe_float(value)
+    if num is None:
+        return "N/A"
+    sign = "+" if num >= 0 else ""
+    return f"{sign}{num:,.{digits}f}"
+
+
+def _fmt_pct(value: Any, digits: int = 2) -> str:
+    num = _safe_float(value)
+    if num is None:
+        return "N/A"
+    return f"{num:.{digits}f}%"
+
+
 def get_analyst_consensus(stock_code: str) -> Dict[str, Any]:
     futu_code = to_futu_code(stock_code)
     if not futu_code:
@@ -171,6 +190,61 @@ def get_capital_distribution(stock_code: str) -> Dict[str, Any]:
     if not futu_code:
         return {}
     return _run_script(_CAPITAL_DIST, [futu_code])
+
+
+def get_short_interest(stock_code: str) -> Dict[str, Any]:
+    """Latest 1-2 official short-interest rows, mapped. Empty if unsupported."""
+    futu_code = to_futu_code(stock_code)
+    if not futu_code:
+        return {}
+    payload = _run_script(_SHORT_INTEREST, ["--num", "2", futu_code])
+    return map_short_interest(payload)
+
+
+def get_search_news(
+    keyword: str,
+    news_sub_type: str = "NEWS",
+    max_count: int = 8,
+) -> List[Dict[str, str]]:
+    """Headlines from official get_search_news.py. Fail-open to []."""
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return []
+    cache_key = f"{keyword.upper()}|{str(news_sub_type).upper()}|{int(max_count)}"
+    with _search_news_lock:
+        cached = _search_news_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+    payload = _run_script(
+        _SEARCH_NEWS,
+        [keyword, "--max-count", str(max_count), "--news-sub-type", news_sub_type],
+    )
+    headlines = map_search_news(payload)
+    with _search_news_lock:
+        _search_news_cache[cache_key] = list(headlines)
+    return headlines
+
+
+def resolve_stock_headlines(
+    stock_code: str,
+    stock_name: str = "",
+    news_sub_type: str = "NEWS",
+) -> List[Dict[str, str]]:
+    """Futu get_search_news first; Longbridge news CLI if Futu is empty/failed."""
+    keyword = (stock_name or stock_code or "").strip()
+    try:
+        headlines = get_search_news(keyword, news_sub_type=news_sub_type)
+    except Exception as exc:
+        logger.info("[Futu] search_news(%s) failed: %s", keyword, exc)
+        headlines = []
+    if headlines:
+        return headlines
+    try:
+        from data_provider.longbridge_cli import get_longbridge_news
+        return get_longbridge_news(stock_code) or []
+    except Exception as exc:
+        logger.info("[Longbridge] news(%s) failed: %s", stock_code, exc)
+        return []
 
 
 def get_us_rating_changes() -> Dict[str, Any]:
@@ -326,6 +400,83 @@ def map_capital_flow_for_analyzer(flow_payload: Dict[str, Any]) -> Optional[Dict
     }
 
 
+def map_short_interest(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Map official get_short_interest.py JSON to sidecar fields.
+
+    First item is the latest row. close_price maps to close. vs_prior is
+    latest minus the previous row. Extra rows after the first two are ignored.
+    Empty or malformed payloads fail open to {}.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items:
+        return {}
+    latest = items[0]
+    if not isinstance(latest, dict):
+        return {}
+    shares_short = _safe_float(latest.get("shares_short"))
+    short_percent = _safe_float(latest.get("short_percent"))
+    days_to_cover = _safe_float(latest.get("days_to_cover"))
+    avg_daily = _safe_float(latest.get("avg_daily_share_volume"))
+    close = _safe_float(latest.get("close_price"))
+    if all(v is None for v in (shares_short, short_percent, days_to_cover, avg_daily, close)):
+        return {}
+    out: Dict[str, Any] = {
+        "shares_short": shares_short if shares_short is not None else latest.get("shares_short"),
+        "short_percent": short_percent if short_percent is not None else latest.get("short_percent"),
+        "days_to_cover": days_to_cover if days_to_cover is not None else latest.get("days_to_cover"),
+        "avg_daily_share_volume": avg_daily if avg_daily is not None else latest.get("avg_daily_share_volume"),
+        "close": close if close is not None else latest.get("close_price"),
+        "as_of": latest.get("timestamp_str") or "",
+    }
+    previous = items[1] if len(items) > 1 and isinstance(items[1], dict) else None
+    if previous is not None:
+        prev_shares = _safe_float(previous.get("shares_short"))
+        prev_pct = _safe_float(previous.get("short_percent"))
+        prev_days = _safe_float(previous.get("days_to_cover"))
+        vs_prior: Dict[str, Any] = {}
+        if shares_short is not None and prev_shares is not None:
+            vs_prior["shares_short"] = shares_short - prev_shares
+        if short_percent is not None and prev_pct is not None:
+            vs_prior["short_percent"] = short_percent - prev_pct
+        if days_to_cover is not None and prev_days is not None:
+            vs_prior["days_to_cover"] = days_to_cover - prev_days
+        if vs_prior:
+            out["vs_prior"] = vs_prior
+    return out
+
+
+def map_search_news(payload: Any) -> List[Dict[str, str]]:
+    """Map official get_search_news.py JSON to headline dicts.
+
+    Official item keys: title / publish_time / source / url.
+    Empty or error payloads fail open to [].
+    """
+    if not isinstance(payload, dict) or payload.get("error"):
+        return []
+    records = payload.get("data")
+    if not isinstance(records, list):
+        return []
+    headlines: List[Dict[str, str]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        title = rec.get("title")
+        if not title:
+            continue
+        headlines.append(
+            {
+                "title": str(title),
+                "time": str(rec.get("publish_time") or ""),
+                "source": str(rec.get("source") or ""),
+                "url": str(rec.get("url") or ""),
+            }
+        )
+    return headlines
+
+
 def apply_capital_flow_to_fundamental(
     fundamental_context: Optional[Dict[str, Any]],
     snap: Dict[str, Any],
@@ -384,6 +535,12 @@ def snapshot(stock_code: str) -> Dict[str, Any]:
         logger.info("[Futu] capital_distribution(%s) failed: %s", stock_code, exc)
         out["capital_distribution"] = {}
         out["capital_distribution_error"] = type(exc).__name__
+    try:
+        out["short_interest"] = get_short_interest(stock_code)
+    except Exception as exc:
+        logger.info("[Futu] short_interest(%s) failed: %s", stock_code, exc)
+        out["short_interest"] = {}
+        out["short_interest_error"] = type(exc).__name__
 
     tape = get_market_tape()
     out["rating_changes"] = tape.get("rating_changes") or {}
@@ -491,6 +648,32 @@ def format_prompt_block(snap: Dict[str, Any]) -> str:
             lines.append(f"- {label} 流入/流出/净: {_fmt_num(inn)} / {_fmt_num(outv)} / {_fmt_num(inn - outv)}")
     else:
         lines.append(f"- 不可用{(' ('+dist_err+')') if dist_err else ''}")
+
+    short = snap.get("short_interest") or {}
+    short_err = snap.get("short_interest_error")
+    lines += ["", "### 空头持仓（Futu OpenD）"]
+    if isinstance(short, dict) and any(
+        short.get(k) is not None
+        for k in ("shares_short", "short_percent", "days_to_cover", "avg_daily_share_volume", "close")
+    ):
+        vs_prior = short.get("vs_prior") if isinstance(short.get("vs_prior"), dict) else {}
+
+        def _with_change(base: str, change_key: str, digits: int) -> str:
+            change = vs_prior.get(change_key) if vs_prior else None
+            if change is None:
+                return base
+            return f"{base}（较上期 {_fmt_signed(change, digits)}）"
+
+        lines += [
+            _with_change(f"- 卖空股数: {_fmt_num(short.get('shares_short'), 0)}", "shares_short", 0),
+            _with_change(f"- 卖空比例: {_fmt_pct(short.get('short_percent'))}", "short_percent", 2),
+            _with_change(f"- 回补天数: {_fmt_num(short.get('days_to_cover'))}", "days_to_cover", 2),
+            f"- 平均日成交量: {_fmt_num(short.get('avg_daily_share_volume'), 0)}",
+            f"- 收盘价: {_fmt_num(short.get('close'))}",
+            f"- 日期: {short.get('as_of') or 'N/A'}",
+        ]
+    else:
+        lines.append(f"- 不可用{(' ('+short_err+')') if short_err else ''}")
 
     ratings = snap.get("rating_changes") or {}
     lines += ["", "### 美股评级变动（宇宙内，Futu OpenD）"]

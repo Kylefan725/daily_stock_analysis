@@ -13,19 +13,30 @@ from unittest.mock import patch
 
 from datetime import date
 
-import data_provider.futu_research as futu_research
+import pytest
 
+import data_provider.futu_research as futu_research
 from data_provider.futu_research import (
     TAPE_UNIVERSE,
     apply_capital_flow_to_fundamental,
     format_prompt_block,
+    get_search_news,
     get_us_earnings_calendar,
     get_us_pre_market_rank,
     get_us_rating_changes,
     map_capital_flow_for_analyzer,
+    map_search_news,
+    map_short_interest,
     snapshot,
     to_futu_code,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_search_news_cache():
+    futu_research._search_news_cache.clear()
+    yield
+    futu_research._search_news_cache.clear()
 
 
 def _proc(payload, returncode=0):
@@ -387,9 +398,263 @@ def test_snapshot_fail_open_on_subprocess_failure() -> None:
     assert snap["capital_flow_error"] == "RuntimeError"
     assert snap["capital_flow_for_analyzer"] is None
     assert snap["capital_distribution"] == {}
+    assert snap["short_interest"] == {}
+    assert snap["short_interest_error"] == "RuntimeError"
     assert snap["rating_changes"]["upgrades"] == []
     assert snap["rating_changes"]["downgrades"] == []
     assert snap["rating_changes"]["new_ratings"] == []
     assert snap["earnings_calendar"]["records"] == []
     assert snap["pre_market_rank"] == {}
     assert snap["pre_market_rank_error"] == "RuntimeError"
+
+
+
+def test_map_short_interest_uses_latest_two_rows_and_vs_prior_change() -> None:
+    """Official get_short_interest.py JSON: first item is latest; close_price -> close."""
+    payload = {
+        "code": "US.NVDA",
+        "data": {
+            "next_key": "-1",
+            "items": [
+                {
+                    "timestamp_str": "2026-08-15",
+                    "shares_short": 50000000,
+                    "short_percent": 2.5,
+                    "avg_daily_share_volume": 28000000,
+                    "days_to_cover": 2.0,
+                    "close_price": 180.5,
+                    "last_close_price": 178.0,
+                },
+                {
+                    "timestamp_str": "2026-07-15",
+                    "shares_short": 45000000,
+                    "short_percent": 1.25,
+                    "avg_daily_share_volume": 27000000,
+                    "days_to_cover": 1.5,
+                    "close_price": 175.0,
+                    "last_close_price": 172.0,
+                },
+                {
+                    "timestamp_str": "2026-06-15",
+                    "shares_short": 40000000,
+                    "short_percent": 1.0,
+                    "avg_daily_share_volume": 26000000,
+                    "days_to_cover": 1.0,
+                    "close_price": 170.0,
+                    "last_close_price": 168.0,
+                },
+            ],
+        },
+    }
+
+    mapped = map_short_interest(payload)
+
+    assert mapped["shares_short"] == 50000000
+    assert mapped["short_percent"] == 2.5
+    assert mapped["days_to_cover"] == 2.0
+    assert mapped["avg_daily_share_volume"] == 28000000
+    assert mapped["close"] == 180.5
+    assert mapped["as_of"] == "2026-08-15"
+    assert mapped["vs_prior"] == {
+        "shares_short": 5000000,
+        "short_percent": 1.25,
+        "days_to_cover": 0.5,
+    }
+
+
+
+def test_map_short_interest_fail_open_on_empty_or_malformed() -> None:
+    assert map_short_interest({}) == {}
+    assert map_short_interest(None) == {}
+    assert map_short_interest({"data": {"items": []}}) == {}
+    assert map_short_interest({"data": {"items": "nope"}}) == {}
+    assert map_short_interest({"data": {"items": [{"timestamp_str": "2026-08-15"}]}}) == {}
+
+
+
+def test_format_prompt_block_includes_short_interest_section() -> None:
+    snap = {
+        "code": "NVDA",
+        "short_interest": {
+            "shares_short": 50000000,
+            "short_percent": 2.5,
+            "days_to_cover": 2.0,
+            "avg_daily_share_volume": 28000000,
+            "close": 180.5,
+            "as_of": "2026-08-15",
+            "vs_prior": {
+                "shares_short": 5000000,
+                "short_percent": 1.25,
+                "days_to_cover": 0.5,
+            },
+        },
+    }
+
+    block = format_prompt_block(snap)
+
+    assert "### 空头持仓（Futu OpenD）" in block
+    assert "- 卖空股数: 50,000,000（较上期 +5,000,000）" in block
+    assert "- 卖空比例: 2.50%（较上期 +1.25）" in block
+    assert "- 回补天数: 2.00（较上期 +0.50）" in block
+    assert "- 平均日成交量: 28,000,000" in block
+    assert "- 收盘价: 180.50" in block
+    assert "- 日期: 2026-08-15" in block
+
+
+
+def test_format_prompt_block_short_interest_unavailable_when_empty() -> None:
+    empty_block = format_prompt_block({"code": "NVDA", "short_interest": {}})
+    assert "### 空头持仓（Futu OpenD）" in empty_block
+    assert "- 不可用" in empty_block.split("### 空头持仓（Futu OpenD）", 1)[1]
+
+    errored = format_prompt_block(
+        {"code": "NVDA", "short_interest": {}, "short_interest_error": "RuntimeError"}
+    )
+    assert "- 不可用 (RuntimeError)" in errored
+
+
+
+def test_snapshot_maps_short_interest_from_official_script_json() -> None:
+    captured = []
+
+    def fake_run(cmd, **_kwargs):
+        captured.append(list(cmd))
+        if "get_short_interest.py" in cmd[1]:
+            return _proc(
+                {
+                    "code": "US.NVDA",
+                    "data": {
+                        "next_key": "-1",
+                        "items": [
+                            {
+                                "timestamp_str": "2026-08-15",
+                                "shares_short": 50000000,
+                                "short_percent": 2.5,
+                                "avg_daily_share_volume": 28000000,
+                                "days_to_cover": 2.0,
+                                "close_price": 180.5,
+                            },
+                            {
+                                "timestamp_str": "2026-07-15",
+                                "shares_short": 45000000,
+                                "short_percent": 1.25,
+                                "avg_daily_share_volume": 27000000,
+                                "days_to_cover": 1.5,
+                                "close_price": 175.0,
+                            },
+                        ],
+                    },
+                }
+            )
+        return _proc({"data": {}})
+
+    futu_research._market_tape_cache = None
+    try:
+        with patch("data_provider.futu_research.subprocess.run", side_effect=fake_run):
+            snap = snapshot("NVDA")
+    finally:
+        futu_research._market_tape_cache = None
+
+    short_cmds = [cmd for cmd in captured if "get_short_interest.py" in cmd[1]]
+    assert len(short_cmds) == 1
+    assert "US.NVDA" in short_cmds[0]
+    assert short_cmds[0][short_cmds[0].index("--num") + 1] == "2"
+    assert snap["short_interest"]["shares_short"] == 50000000
+    assert snap["short_interest"]["short_percent"] == 2.5
+    assert snap["short_interest"]["close"] == 180.5
+    assert snap["short_interest"]["as_of"] == "2026-08-15"
+    assert snap["short_interest"]["vs_prior"]["shares_short"] == 5000000
+
+
+
+def test_map_search_news_returns_headline_fields_from_official_json() -> None:
+    payload = {
+        "keyword": "NVIDIA",
+        "news_sub_type": "NEWS",
+        "count": 2,
+        "data": [
+            {
+                "title": "NVIDIA announces new GPU",
+                "news_sub_type": "NEWS",
+                "source": "Reuters",
+                "publish_time": "2026-08-16 10:00:00",
+                "view_count": 100,
+                "related_securities": ["US.NVDA"],
+                "url": "https://news.example.com/nvda-gpu",
+            },
+            {
+                "title": "Chip demand stays firm",
+                "news_sub_type": "NEWS",
+                "source": "Bloomberg",
+                "publish_time": "2026-08-15 08:30:00",
+                "url": "https://news.example.com/chip-demand",
+            },
+        ],
+    }
+
+    headlines = map_search_news(payload)
+
+    assert headlines == [
+        {
+            "title": "NVIDIA announces new GPU",
+            "time": "2026-08-16 10:00:00",
+            "source": "Reuters",
+            "url": "https://news.example.com/nvda-gpu",
+        },
+        {
+            "title": "Chip demand stays firm",
+            "time": "2026-08-15 08:30:00",
+            "source": "Bloomberg",
+            "url": "https://news.example.com/chip-demand",
+        },
+    ]
+
+
+def test_map_search_news_fail_open_on_empty_or_error() -> None:
+    assert map_search_news({}) == []
+    assert map_search_news(None) == []
+    assert map_search_news({"error": "opend down"}) == []
+    assert map_search_news({"data": []}) == []
+    assert map_search_news({"data": "nope"}) == []
+
+
+
+def test_get_search_news_caches_second_call_for_same_symbol() -> None:
+    captured = []
+
+    def fake_run(cmd, **_kwargs):
+        captured.append(list(cmd))
+        return _proc(
+            {
+                "keyword": "NVIDIA",
+                "news_sub_type": "NEWS",
+                "data": [
+                    {
+                        "title": "NVIDIA announces new GPU",
+                        "source": "Reuters",
+                        "publish_time": "2026-08-16 10:00:00",
+                        "url": "https://news.example.com/nvda-gpu",
+                    }
+                ],
+            }
+        )
+
+    futu_research._search_news_cache.clear()
+    try:
+        with patch("data_provider.futu_research.subprocess.run", side_effect=fake_run):
+            first = get_search_news("NVIDIA")
+            second = get_search_news("NVIDIA")
+    finally:
+        futu_research._search_news_cache.clear()
+
+    assert first == [
+        {
+            "title": "NVIDIA announces new GPU",
+            "time": "2026-08-16 10:00:00",
+            "source": "Reuters",
+            "url": "https://news.example.com/nvda-gpu",
+        }
+    ]
+    assert second == first
+    news_cmds = [cmd for cmd in captured if "get_search_news.py" in cmd[1]]
+    assert len(news_cmds) == 1

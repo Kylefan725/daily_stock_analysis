@@ -4347,6 +4347,49 @@ class SearchService:
             error_message="事件搜索失败"
         )
     
+    def _headlines_to_search_response(
+        self,
+        query: str,
+        headlines: List[Dict[str, Any]],
+        provider: str,
+    ) -> SearchResponse:
+        results = [
+            SearchResult(
+                title=str(item.get("title") or ""),
+                snippet="",
+                url=str(item.get("url") or ""),
+                source=str(item.get("source") or provider),
+                published_date=str(item.get("time") or "") or None,
+            )
+            for item in headlines
+            if isinstance(item, dict) and item.get("title")
+        ]
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=provider,
+            success=True,
+        )
+
+    def _resolve_us_hk_stock_news(
+        self,
+        stock_code: str,
+        stock_name: str,
+        dim: Dict[str, Any],
+        news_sub_type: str,
+    ) -> SearchResponse:
+        from data_provider.futu_research import resolve_stock_headlines
+
+        headlines = resolve_stock_headlines(
+            stock_code,
+            stock_name,
+            news_sub_type=news_sub_type,
+        )
+        provider = "Longbridge" if headlines and all(
+            item.get("source") == "Longbridge" for item in headlines
+        ) else "Futu"
+        return self._headlines_to_search_response(dim["query"], headlines, provider)
+
     def search_comprehensive_intel(
         self,
         stock_code: str,
@@ -4506,6 +4549,22 @@ class SearchService:
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
+
+            if is_foreign and not is_index_etf and dim["name"] in {"latest_news", "risk_check"}:
+                news_sub_type = "NOTICE" if dim["name"] == "risk_check" else "NEWS"
+                logger.info(
+                    "[情报搜索] %s: 使用 Futu/Longbridge 头条 subtype=%s，不走 SerpAPI",
+                    dim["desc"],
+                    news_sub_type,
+                )
+                response = self._resolve_us_hk_stock_news(
+                    stock_code, stock_name, dim, news_sub_type=news_sub_type
+                )
+                results[dim["name"]] = self._limit_search_response(
+                    response, max_results=target_per_dimension
+                )
+                search_count += 1
+                continue
             
             # 选择搜索引擎（轮流使用）
             available_providers = [p for p in self._providers if p.is_available]

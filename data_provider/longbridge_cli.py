@@ -60,3 +60,45 @@ def first_row(payload: Any) -> Optional[dict]:
     if isinstance(payload, dict):
         return payload
     return None
+
+
+
+def map_longbridge_news(payload: Any) -> List[dict]:
+    """Map `longbridge news SYMBOL --format json` to headline dicts.
+
+    Official schema fields: id, title, url, published_at, likes_count,
+    comments_count. There is no source field; source is the CLI provider name.
+    Empty or malformed payloads fail open to [].
+    """
+    if not isinstance(payload, list):
+        return []
+    headlines: List[dict] = []
+    for rec in payload:
+        if not isinstance(rec, dict):
+            continue
+        title = rec.get("title")
+        if not title:
+            continue
+        headlines.append(
+            {
+                "title": str(title),
+                "time": str(rec.get("published_at") or ""),
+                "source": "Longbridge",
+                "url": str(rec.get("url") or ""),
+            }
+        )
+    return headlines
+
+
+
+def get_longbridge_news(stock_code: str, count: int = 8) -> List[dict]:
+    """Latest headlines via `longbridge news SYMBOL --format json`. Fail-open to []."""
+    try:
+        from data_provider.longbridge_fetcher import _to_longbridge_symbol
+        symbol = _to_longbridge_symbol(stock_code)
+    except Exception:
+        symbol = None
+    if not symbol:
+        return []
+    payload = run_json(["news", symbol, "--count", str(count)])
+    return map_longbridge_news(payload)
