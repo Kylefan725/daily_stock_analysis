@@ -543,6 +543,22 @@ class StockAnalysisPipeline:
                 code,
                 fundamental_context,
             )
+
+            # Futu OpenD daily tape: one snapshot per name, fail-open.
+            # Overlay mapped capital_flow so analyzer bias can see US numbers.
+            futu_snap = None
+            try:
+                from data_provider.futu_research import (
+                    apply_capital_flow_to_fundamental,
+                    snapshot as futu_snapshot,
+                )
+                futu_snap = futu_snapshot(code)
+                fundamental_context = apply_capital_flow_to_fundamental(
+                    fundamental_context, futu_snap
+                )
+            except Exception as exc:
+                logger.warning("%s(%s) Futu OpenD snapshot failed: %s", stock_name, code, exc)
+
             market_structure_context = self._build_market_structure_context(
                 code=code,
                 stock_name=stock_name,
@@ -627,10 +643,11 @@ class StockAnalysisPipeline:
                     news_context = self.search_service.format_intel_report(intel_results, stock_name)
                     try:
                         from data_provider.futu_research import format_prompt_block, snapshot as futu_snapshot
-                        futu_block = format_prompt_block(futu_snapshot(code))
+                        snap = futu_snap if futu_snap is not None else futu_snapshot(code)
+                        futu_block = format_prompt_block(snap)
                         if futu_block:
                             news_context = f"{futu_block}\n{news_context or ''}".strip()
-                            logger.info("%s(%s) 已注入 Futu OpenD 一致预期/财报", stock_name, code)
+                            logger.info("%s(%s) 已注入 Futu OpenD 一致预期/财报/日频磁带", stock_name, code)
                     except Exception as exc:
                         logger.warning("%s(%s) Futu OpenD 注入失败: %s", stock_name, code, exc)
                     total_results = sum(
@@ -659,7 +676,8 @@ class StockAnalysisPipeline:
                 logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
                 try:
                     from data_provider.futu_research import format_prompt_block, snapshot as futu_snapshot
-                    futu_block = format_prompt_block(futu_snapshot(code))
+                    snap = futu_snap if futu_snap is not None else futu_snapshot(code)
+                    futu_block = format_prompt_block(snap)
                     if futu_block:
                         news_context = futu_block
                 except Exception as exc:
