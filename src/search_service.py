@@ -4384,6 +4384,7 @@ class SearchService:
             # providers receive the Chinese name and miss English headlines.
             english_aliases = self._foreign_english_query_terms(stock_code, stock_name)
             effective_name = english_aliases[0] if english_aliases else stock_name
+            # US/HK forecasts and market share come from Futu OpenD, not Google.
             search_dimensions = [
                 {
                     'name': 'latest_news',
@@ -4391,13 +4392,6 @@ class SearchService:
                     'desc': '最新消息',
                     'tavily_topic': 'news',
                     'strict_freshness': True,
-                },
-                {
-                    'name': 'market_analysis',
-                    'query': f"{effective_name} analyst rating target price report",
-                    'desc': '机构分析',
-                    'tavily_topic': None,
-                    'strict_freshness': False,
                 },
                 {
                     'name': 'risk_check',
@@ -4411,20 +4405,14 @@ class SearchService:
                 },
                 {
                     'name': 'earnings',
-                    'query': (
-                        f"{effective_name} {stock_code} index performance composition outlook"
-                        if is_index_etf else f"{effective_name} earnings revenue profit growth forecast"
-                    ),
+                    'query': f"{effective_name} {stock_code} index performance composition outlook",
                     'desc': '业绩预期',
                     'tavily_topic': None,
                     'strict_freshness': False,
                 },
                 {
                     'name': 'industry',
-                    'query': (
-                        f"{effective_name} {stock_code} index sector allocation holdings"
-                        if is_index_etf else f"{effective_name} industry competitors market share outlook"
-                    ),
+                    'query': f"{effective_name} {stock_code} index sector allocation holdings",
                     'desc': '行业分析',
                     'tavily_topic': None,
                     'strict_freshness': False,
@@ -4488,6 +4476,12 @@ class SearchService:
                 },
             ]
         
+        if is_foreign and not is_index_etf:
+            search_dimensions = [
+                dim for dim in search_dimensions
+                if dim.get("name") in {"latest_news", "risk_check"}
+            ]
+
         search_days = self._effective_news_window_days()
         target_per_dimension = 3
         provider_max_results = self._provider_request_size(target_per_dimension)

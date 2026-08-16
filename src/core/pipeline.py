@@ -625,6 +625,14 @@ class StockAnalysisPipeline:
                 # 格式化情报报告
                 if intel_results:
                     news_context = self.search_service.format_intel_report(intel_results, stock_name)
+                    try:
+                        from data_provider.futu_research import format_prompt_block, snapshot as futu_snapshot
+                        futu_block = format_prompt_block(futu_snapshot(code))
+                        if futu_block:
+                            news_context = f"{futu_block}\n{news_context or ''}".strip()
+                            logger.info("%s(%s) 已注入 Futu OpenD 一致预期/财报", stock_name, code)
+                    except Exception as exc:
+                        logger.warning("%s(%s) Futu OpenD 注入失败: %s", stock_name, code, exc)
                     total_results = sum(
                         len(r.results) for r in intel_results.values() if r.success
                     )
@@ -649,6 +657,13 @@ class StockAnalysisPipeline:
                         logger.warning(f"{stock_name}({code}) 保存新闻情报失败: {e}")
             else:
                 logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
+                try:
+                    from data_provider.futu_research import format_prompt_block, snapshot as futu_snapshot
+                    futu_block = format_prompt_block(futu_snapshot(code))
+                    if futu_block:
+                        news_context = futu_block
+                except Exception as exc:
+                    logger.warning("%s(%s) Futu OpenD 注入失败: %s", stock_name, code, exc)
 
             # Step 4.5: Social sentiment intelligence (US stocks only)
             if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
