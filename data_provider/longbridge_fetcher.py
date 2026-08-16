@@ -36,6 +36,7 @@ import pandas as pd
 from .base import BaseFetcher, STANDARD_COLUMNS
 from .realtime_types import UnifiedRealtimeQuote, RealtimeSource, safe_float
 from .us_index_mapping import is_us_stock_code, is_us_index_code
+from . import longbridge_cli
 
 logger = logging.getLogger(__name__)
 
@@ -485,14 +486,22 @@ class LongbridgeFetcher(BaseFetcher):
             creds = _longbridge_credentials(get_config())
         except Exception:
             creds = _longbridge_credentials()
-        self._available = _has_legacy_credentials(creds) or _has_oauth_credentials(creds)
+        self._available = (
+            _has_legacy_credentials(creds)
+            or _has_oauth_credentials(creds)
+            or longbridge_cli.cli_logged_in()
+        )
         return self._available
 
     @staticmethod
     def has_configured_credentials(config: Any = None) -> bool:
         """Return True when runtime config can attempt Longbridge auth."""
         creds = _longbridge_credentials(config)
-        return _has_legacy_credentials(creds) or _has_oauth_credentials(creds)
+        return (
+            _has_legacy_credentials(creds)
+            or _has_oauth_credentials(creds)
+            or longbridge_cli.cli_logged_in()
+        )
 
     def _get_ctx(self):
         """Lazy-init the QuoteContext (thread-safe)."""
@@ -606,7 +615,10 @@ class LongbridgeFetcher(BaseFetcher):
                         else "未找到可用 OAuth token 缓存且未配置完整 Legacy 三件套"
                     )
                     logger.warning("[Longbridge] 未建立认证配置: %s", reason)
-                    self._available = False
+                    if not longbridge_cli.cli_logged_in():
+                        self._available = False
+                    else:
+                        logger.info("[Longbridge] SDK token 不可用，改用已登录的 longbridge CLI")
                     return None
 
                 # Diagnostic logging
@@ -624,7 +636,8 @@ class LongbridgeFetcher(BaseFetcher):
                 return self._ctx
             except Exception as e:
                 logger.warning("[Longbridge] QuoteContext 初始化失败: %s", e)
-                self._available = False
+                if not longbridge_cli.cli_logged_in():
+                    self._available = False
                 return None
 
     # ------------------------------------------------------------------
@@ -643,7 +656,11 @@ class LongbridgeFetcher(BaseFetcher):
 
         ctx = self._get_ctx()
         if ctx is None:
-            return None
+            info = self._static_via_cli(symbol)
+            if info is not None and ttl > 0:
+                with self._static_cache_lock:
+                    self._static_cache[symbol] = (info, now)
+            return info
         try:
             infos = ctx.static_info([symbol])
             if infos:
@@ -697,7 +714,7 @@ class LongbridgeFetcher(BaseFetcher):
             return None
         ctx = self._get_ctx()
         if ctx is None:
-            return None
+            return self._volume_ratio_via_cli(symbol, today_volume)
         try:
             from longbridge.openapi import Period, AdjustType
 
@@ -752,7 +769,7 @@ class LongbridgeFetcher(BaseFetcher):
 
         ctx = self._get_ctx()
         if ctx is None:
-            return None
+            return self._quote_via_cli(stock_code, symbol)
 
         try:
             quotes = ctx.quote([symbol])
@@ -878,7 +895,7 @@ class LongbridgeFetcher(BaseFetcher):
 
         ctx = self._get_ctx()
         if ctx is None:
-            raise RuntimeError("Longbridge QuoteContext not available")
+            return self._daily_via_cli(symbol, start_date, end_date)
 
         from longbridge.openapi import Period, AdjustType
 
@@ -921,6 +938,240 @@ class LongbridgeFetcher(BaseFetcher):
                 "turnover": safe_float(getattr(c, "turnover", None)),
             })
 
+        return pd.DataFrame(rows)
+
+
+    def _static_via_cli(self, symbol: str) -> Optional[Any]:
+        """Map `longbridge static` JSON onto the SDK static_info attribute surface."""
+        try:
+            row = longbridge_cli.first_row(longbridge_cli.run_json(["static", symbol]))
+        except Exception as exc:
+            logger.debug("[Longbridge] CLI static(%s) 失败: %s", symbol, exc)
+            return None
+        if not row:
+            return None
+        circulating = row.get("circulating_shares", row.get("circ._shares"))
+        return type("CliStaticInfo", (), {
+            "name_cn": str(row.get("name") or ""),
+            "name_en": str(row.get("name") or ""),
+            "circulating_shares": circulating,
+            "total_shares": row.get("total_shares"),
+            "eps_ttm": row.get("eps_ttm"),
+            "eps": row.get("eps"),
+            "bps": row.get("bps"),
+        })()
+
+    def _volume_ratio_via_cli(self, symbol: str, today_volume: int) -> Optional[float]:
+        try:
+            row = longbridge_cli.first_row(
+                longbridge_cli.run_json(
+                    ["calc-index", symbol, "--fields", "volume_ratio"]
+                )
+            )
+        except Exception as exc:
+            logger.debug("[Longbridge] CLI calc-index(%s) 失败: %s", symbol, exc)
+            row = None
+        if row:
+            ratio = safe_float(row.get("volume_ratio"))
+            if ratio is not None:
+                return round(ratio, 2)
+        try:
+            candles = longbridge_cli.run_json(
+                ["kline", symbol, "--period", "day", "--count", "6", "--adjust", "none"]
+            )
+        except Exception as exc:
+            logger.debug("[Longbridge] CLI kline(%s) 失败: %s", symbol, exc)
+            return None
+        if not isinstance(candles, list) or len(candles) < 2:
+            return None
+        past = []
+        for c in candles[:-1]:
+            vol = int(safe_float(c.get("volume")) or 0)
+            if vol > 0:
+                past.append(vol)
+        if not past or today_volume <= 0:
+            return None
+        avg = sum(past) / len(past)
+        if avg <= 0:
+            return None
+        return round(today_volume / avg, 2)
+
+    def _quote_via_cli(self, stock_code: str, symbol: str) -> Optional[UnifiedRealtimeQuote]:
+        try:
+            row = longbridge_cli.first_row(longbridge_cli.run_json(["quote", symbol]))
+        except Exception as exc:
+            logger.info("[Longbridge] CLI quote(%s) 失败: %s", symbol, exc)
+            return None
+        if not row:
+            return None
+        price = safe_float(row.get("last") or row.get("last_done"))
+        if price is None or price <= 0:
+            return None
+        prev_close = safe_float(row.get("prev_close"))
+        open_price = safe_float(row.get("open"))
+        high = safe_float(row.get("high"))
+        low = safe_float(row.get("low"))
+        volume = int(safe_float(row.get("volume")) or 0)
+        turnover = safe_float(row.get("turnover"))
+        change_amount = safe_float(row.get("change_value"))
+        change_pct = safe_float(row.get("change_percentage"))
+        amplitude = None
+        if change_amount is None and prev_close and prev_close > 0:
+            change_amount = round(price - prev_close, 4)
+        if change_pct is None and prev_close and prev_close > 0:
+            change_pct = round((price - prev_close) / prev_close * 100, 2)
+        if prev_close and prev_close > 0 and high is not None and low is not None:
+            amplitude = round((high - low) / prev_close * 100, 2)
+
+        static = self._get_static_info(symbol)
+        calc = None
+        try:
+            calc = longbridge_cli.first_row(
+                longbridge_cli.run_json(
+                    [
+                        "calc-index",
+                        symbol,
+                        "--fields",
+                        "pe,pb,turnover_rate,volume_ratio,mktcap",
+                    ]
+                )
+            )
+        except Exception as exc:
+            logger.debug("[Longbridge] CLI calc-index(%s) 失败: %s", symbol, exc)
+
+        turnover_rate = None
+        pe_ratio = None
+        pb_ratio = None
+        total_mv = None
+        circ_mv = None
+        name = ""
+        if static is not None:
+            name = getattr(static, "name_cn", "") or getattr(static, "name_en", "") or ""
+            circulating = int(safe_float(getattr(static, "circulating_shares", None)) or 0)
+            total_shares = int(safe_float(getattr(static, "total_shares", None)) or 0)
+            if circulating > 0:
+                circ_mv = round(price * circulating, 2)
+            if total_shares > 0:
+                total_mv = round(price * total_shares, 2)
+        if calc:
+            pe_ratio = safe_float(calc.get("pe"))
+            pb_ratio = safe_float(calc.get("pb"))
+            turnover_rate = safe_float(calc.get("turnover_rate"))
+            total_mv = safe_float(calc.get("mktcap")) or total_mv
+        if pe_ratio is None and static is not None:
+            eps = safe_float(getattr(static, "eps_ttm", None)) or safe_float(getattr(static, "eps", None))
+            if eps and eps > 0:
+                pe_ratio = round(price / eps, 2)
+        if pb_ratio is None and static is not None:
+            bps = safe_float(getattr(static, "bps", None))
+            if bps and bps > 0:
+                pb_ratio = round(price / bps, 2)
+        if turnover_rate is None and static is not None and volume > 0:
+            circulating = int(safe_float(getattr(static, "circulating_shares", None)) or 0)
+            total_shares = int(safe_float(getattr(static, "total_shares", None)) or 0)
+            shares = circulating if circulating > 0 else total_shares
+            if shares > 0:
+                turnover_rate = round(volume / shares * 100, 4)
+
+        volume_ratio = None
+        if calc:
+            volume_ratio = safe_float(calc.get("volume_ratio"))
+            if volume_ratio is not None:
+                volume_ratio = round(volume_ratio, 2)
+        if volume_ratio is None:
+            volume_ratio = self._compute_volume_ratio(symbol, volume)
+
+        quote = UnifiedRealtimeQuote(
+            code=stock_code,
+            name=name,
+            source=RealtimeSource.LONGBRIDGE,
+            price=price,
+            change_pct=change_pct,
+            change_amount=change_amount,
+            volume=volume if volume > 0 else None,
+            amount=turnover,
+            volume_ratio=volume_ratio,
+            turnover_rate=turnover_rate,
+            amplitude=amplitude,
+            open_price=open_price,
+            high=high,
+            low=low,
+            pre_close=prev_close,
+            pe_ratio=pe_ratio,
+            pb_ratio=pb_ratio,
+            total_mv=total_mv,
+            circ_mv=circ_mv,
+        )
+        logger.info(
+            "[Longbridge] %s CLI 行情获取成功: 价格=%s, 量比=%s, 换手率=%s, PE=%s",
+            symbol,
+            price,
+            volume_ratio,
+            turnover_rate,
+            pe_ratio,
+        )
+        return quote
+
+    def _daily_via_cli(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        candles = None
+        try:
+            candles = longbridge_cli.run_json(
+                [
+                    "kline",
+                    "history",
+                    symbol,
+                    "--start",
+                    start_date,
+                    "--end",
+                    end_date,
+                    "--period",
+                    "day",
+                    "--adjust",
+                    "forward",
+                ]
+            )
+        except Exception as exc:
+            logger.debug("[Longbridge] CLI kline history(%s) 失败，改用 count: %s", symbol, exc)
+        if not candles:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+            span = max((end_dt - start_dt).days + 5, 10)
+            count = min(max(span, 10), 500)
+            candles = longbridge_cli.run_json(
+                [
+                    "kline",
+                    symbol,
+                    "--period",
+                    "day",
+                    "--count",
+                    str(count),
+                    "--adjust",
+                    "forward",
+                ]
+            )
+        if not candles:
+            return pd.DataFrame()
+        rows = []
+        for c in candles:
+            ts = c.get("time") or c.get("timestamp")
+            if not ts:
+                continue
+            if isinstance(ts, (int, float)):
+                dt = datetime.fromtimestamp(int(ts)).date()
+            else:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).date()
+            date_s = dt.strftime("%Y-%m-%d")
+            if date_s < start_date or date_s > end_date:
+                continue
+            rows.append({
+                "date": date_s,
+                "open": safe_float(c.get("open")),
+                "high": safe_float(c.get("high")),
+                "low": safe_float(c.get("low")),
+                "close": safe_float(c.get("close")),
+                "volume": int(safe_float(c.get("volume")) or 0),
+                "turnover": safe_float(c.get("turnover")),
+            })
         return pd.DataFrame(rows)
 
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
